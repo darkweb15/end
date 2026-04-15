@@ -1,12 +1,13 @@
-"""Google Maps scraper using Playwright for fast parallel scraping."""
+"""Google Maps scraper using Playwright — rebuilt with proven techniques."""
 
 import asyncio
+import json
 import re
 import logging
 from datetime import datetime
 from urllib.parse import quote_plus
 
-from playwright.async_api import async_playwright, Page, BrowserContext
+from playwright.async_api import async_playwright, Page
 
 from app.config import SCROLL_PAUSE_TIME, MAX_SCROLLS
 from app.models import LeadResult
@@ -16,7 +17,10 @@ logger = logging.getLogger(__name__)
 
 async def _extract_place_data(page: Page, search_query: str, zipcode: str,
                                city: str, state: str, country: str) -> LeadResult:
-    """Extract data from a Google Maps place detail page."""
+    """
+    Extract data from a Google Maps place detail page.
+    Uses the proven approach: wait for h1.DUwDvf, then extract via JS evaluate.
+    """
     lead = LeadResult(
         date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         search_query=search_query,
@@ -27,131 +31,132 @@ async def _extract_place_data(page: Page, search_query: str, zipcode: str,
     )
 
     try:
-        # Wait for the place details panel
-        await page.wait_for_selector('[role="main"]', timeout=8000)
+        # KEY: Wait for the place name heading — this ensures all detail data is loaded
+        try:
+            await page.wait_for_selector('h1.DUwDvf, h1.lfPIob', timeout=10000)
+        except Exception:
+            logger.warning("Timeout waiting for place name heading")
+            return lead
+
         await asyncio.sleep(1)
 
-        # Name
-        try:
-            name_el = await page.query_selector('h1')
-            if name_el:
-                lead.name = (await name_el.inner_text()).strip()
-        except Exception:
-            pass
+        # Extract all data in one JavaScript call
+        data = await page.evaluate("""() => {
+            const result = {};
 
-        # Rating
-        try:
-            rating_el = await page.query_selector('div.F7nice span[aria-hidden="true"]')
-            if rating_el:
-                lead.rating = (await rating_el.inner_text()).strip()
-        except Exception:
-            pass
+            // Name
+            const h1 = document.querySelector('h1.DUwDvf') || document.querySelector('h1.lfPIob');
+            if (h1) result.name = h1.textContent.trim();
 
-        # Reviews count
-        try:
-            reviews_el = await page.query_selector('div.F7nice span[aria-label*="review"]')
-            if reviews_el:
-                label = await reviews_el.get_attribute("aria-label")
-                if label:
-                    nums = re.findall(r'[\d,]+', label)
-                    if nums:
-                        lead.reviews_count = nums[0].replace(",", "")
-        except Exception:
-            pass
+            // Rating + Reviews from div.F7nice
+            const ratingEl = document.querySelector('div.F7nice');
+            if (ratingEl) {
+                const txt = ratingEl.textContent.trim();
+                // Pattern: "4.8(290)" or "4.8 ***** 1,864 Google reviews"
+                const ratingMatch = txt.match(/(\\d[.,]\\d+)/);
+                if (ratingMatch) result.rating = ratingMatch[1];
 
-        # Category / Cuisine
-        try:
-            cat_el = await page.query_selector('button[jsaction*="category"]')
-            if cat_el:
-                lead.cuisine_types = (await cat_el.inner_text()).strip()
-                lead.category = lead.cuisine_types
-        except Exception:
-            pass
+                if (txt.includes('(')) {
+                    const inner = txt.split('(')[1]?.split(')')[0] || '';
+                    const clean = inner.replace(/[^\\d]/g, '');
+                    if (clean) result.reviews_count = clean;
+                } else {
+                    const countMatch = txt.match(/([\\d,]+)\\s*(?:Google\\s*)?reviews?/i);
+                    if (countMatch) result.reviews_count = countMatch[1].replace(/,/g, '');
+                }
+            }
 
-        # Price range
-        try:
-            price_el = await page.query_selector('span[aria-label*="Price"]')
-            if price_el:
-                lead.price_range = (await price_el.inner_text()).strip()
-        except Exception:
-            pass
+            // Try JSON-LD for stable review count
+            try {
+                const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                for (const script of scripts) {
+                    const data = JSON.parse(script.textContent);
+                    const items = Array.isArray(data) ? data : [data];
+                    for (const item of items) {
+                        if (item?.aggregateRating?.reviewCount) {
+                            result.reviews_count = String(item.aggregateRating.reviewCount).replace(/[^\\d]/g, '');
+                        }
+                        if (item?.aggregateRating?.ratingValue && !result.rating) {
+                            result.rating = String(item.aggregateRating.ratingValue);
+                        }
+                    }
+                }
+            } catch(e) {}
 
-        # Extract info from the details section
-        info_items = await page.query_selector_all('[data-item-id]')
-        for item in info_items:
-            try:
-                item_id = await item.get_attribute("data-item-id") or ""
-                text = (await item.inner_text()).strip()
+            // Category
+            const cat = document.querySelector('button[jsaction*="category"]');
+            if (cat) result.category = cat.textContent.trim();
 
-                if "address" in item_id or item_id == "address":
-                    lead.address = text
-                elif "phone" in item_id or item_id.startswith("phone"):
-                    lead.phone = text
-                elif "authority" in item_id or item_id == "authority":
-                    lead.website = text
-            except Exception:
-                continue
+            // Price range
+            const price = document.querySelector('[aria-label^="Price:"]');
+            if (price) {
+                const label = price.getAttribute('aria-label') || '';
+                result.price_range = label.replace('Price:', '').trim();
+            }
 
-        # Maps URL and Place ID
-        current_url = page.url
-        lead.maps_url = current_url
-        place_match = re.search(r'place/([^/]+)', current_url)
-        if place_match:
-            lead.place_id = place_match.group(1)
+            // Data items: address, phone, website, hours
+            // Website: get href from <a> tag (not text!) — this is the key fix
+            const authorityEl = document.querySelector('a[data-item-id="authority"]');
+            if (authorityEl) {
+                result.website = authorityEl.href || authorityEl.textContent.trim();
+            }
 
-        # Also try to get place_id from data attribute
-        try:
-            place_id_match = re.search(r'0x[0-9a-f]+:0x[0-9a-f]+', current_url)
-            if place_id_match:
-                lead.place_id = place_id_match.group(0)
-        except Exception:
-            pass
+            const addressEl = document.querySelector('button[data-item-id="address"]');
+            if (addressEl) result.address = addressEl.textContent.replace(/[\\ue000-\\uf8ff]/g, '').trim();
 
-        # Opening hours
-        try:
-            hours_btn = await page.query_selector('[data-item-id="oh"]')
-            if hours_btn:
-                hours_text = await hours_btn.inner_text()
-                lead.opening_hours = hours_text.replace("\n", " | ").strip()
-        except Exception:
-            pass
+            const phoneEl = document.querySelector('button[data-item-id^="phone"]');
+            if (phoneEl) result.phone = phoneEl.textContent.replace(/[\\ue000-\\uf8ff]/g, '').trim();
 
-        # Closure status
-        try:
-            status_elements = await page.query_selector_all('span')
-            for el in status_elements:
-                text = (await el.inner_text()).strip().lower()
-                if "permanently closed" in text:
-                    lead.closure_status = "Permanently Closed"
-                    lead.status = "Closed"
-                    break
-                elif "temporarily closed" in text:
-                    lead.closure_status = "Temporarily Closed"
-                    lead.status = "Temporarily Closed"
-                    break
-            if not lead.status:
-                lead.status = "Open"
-                lead.closure_status = "Open"
-        except Exception:
-            lead.status = "Unknown"
+            // Opening hours
+            const hoursEl = document.querySelector('[data-item-id="oh"]');
+            if (hoursEl) result.opening_hours = hoursEl.textContent.replace(/[\\ue000-\\uf8ff]/g, '').replace(/\\n/g, ' | ').trim();
 
-        # Try to extract email from Google Maps listing itself
-        try:
-            page_content = await page.content()
-            email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-            emails_found = re.findall(email_pattern, page_content)
-            # Filter out Google/Maps related emails
-            filtered = [
-                e for e in emails_found
-                if not any(
-                    x in e.lower()
-                    for x in ["google", "gstatic", "gmail", "youtube", "android"]
+            // Closure status
+            result.status = 'Open';
+            result.closure_status = 'Open';
+            const bodyText = document.body.innerHTML;
+            if (/\\bPermanently closed\\b/i.test(bodyText)) {
+                result.status = 'Closed';
+                result.closure_status = 'Permanently Closed';
+            } else if (/\\bTemporar(?:il)?y closed\\b/i.test(bodyText)) {
+                result.status = 'Temporarily Closed';
+                result.closure_status = 'Temporarily Closed';
+            }
+
+            // Place ID from URL
+            const placeIdMatch = window.location.href.match(/ChIJ[a-zA-Z0-9_-]+/);
+            if (placeIdMatch) result.place_id = placeIdMatch[0];
+
+            // Extract emails from page
+            const emailRegex = /[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}/g;
+            const emails = (bodyText.match(emailRegex) || []).filter(
+                e => !['google','gstatic','gmail','youtube','android','schema.org','w3.org'].some(
+                    x => e.toLowerCase().includes(x)
                 )
-            ]
-            if filtered:
-                lead.google_maps_email = filtered[0]
-        except Exception:
-            pass
+            );
+            if (emails.length > 0) result.google_maps_email = emails[0];
+
+            return result;
+        }""")
+
+        # Map extracted data to lead
+        lead.name = data.get("name", "")
+        lead.address = data.get("address", "")
+        lead.phone = data.get("phone", "")
+        lead.website = data.get("website", "")
+        lead.rating = data.get("rating", "")
+        lead.reviews_count = data.get("reviews_count", "")
+        lead.category = data.get("category", "")
+        lead.cuisine_types = data.get("category", "")
+        lead.price_range = data.get("price_range", "")
+        lead.opening_hours = data.get("opening_hours", "")
+        lead.status = data.get("status", "Open")
+        lead.closure_status = data.get("closure_status", "Open")
+        lead.google_maps_email = data.get("google_maps_email", "")
+        lead.place_id = data.get("place_id", "")
+        lead.maps_url = page.url
+
+        logger.info(f"Extracted: {lead.name} | web={lead.website} | phone={lead.phone}")
 
     except Exception as e:
         logger.error(f"Error extracting place data: {e}")
@@ -159,49 +164,36 @@ async def _extract_place_data(page: Page, search_query: str, zipcode: str,
     return lead
 
 
-async def _scroll_results(page: Page) -> list:
-    """Scroll through Google Maps search results to load more."""
-    results_selector = '[role="feed"]'
-    try:
-        await page.wait_for_selector(results_selector, timeout=10000)
-    except Exception:
-        # Try alternative selector
-        results_selector = 'div[role="main"]'
-        try:
-            await page.wait_for_selector(results_selector, timeout=5000)
-        except Exception:
-            return []
-
+async def collect_links(page: Page, feed_selector: str, max_results: int) -> list[str]:
+    """Scroll and collect Google Maps place links from the feed."""
     links = set()
-    for _ in range(MAX_SCROLLS):
-        # Get all result links
-        elements = await page.query_selector_all('a[href*="/maps/place/"]')
-        for el in elements:
-            href = await el.get_attribute("href")
-            if href:
+    max_scrolls = min(MAX_SCROLLS, 8)
+
+    for scroll_i in range(max_scrolls):
+        # Collect links from visible cards
+        cards = await page.query_selector_all('a.hfpxzc')
+        if not cards:
+            cards = await page.query_selector_all('a[href*="/maps/place/"]')
+
+        for card in cards:
+            href = await card.get_attribute("href")
+            if href and "/maps/place/" in href:
                 links.add(href)
 
-        # Scroll down in the results panel
+        if len(links) >= max_results:
+            break
+
+        # Scroll the feed
         try:
-            feed = await page.query_selector(results_selector)
+            feed = await page.query_selector(feed_selector)
             if feed:
-                await feed.evaluate('el => el.scrollTop = el.scrollHeight')
+                await feed.evaluate('el => el.scrollBy(0, 2000)')
         except Exception:
             break
 
         await asyncio.sleep(SCROLL_PAUSE_TIME)
 
-        # Check if we reached the end
-        try:
-            end_el = await page.query_selector('span.HlvSq')
-            if end_el:
-                end_text = await end_el.inner_text()
-                if "end of list" in end_text.lower() or "You've reached the end" in end_text:
-                    break
-        except Exception:
-            pass
-
-    return list(links)
+    return list(links)[:max_results]
 
 
 async def scrape_google_maps(
@@ -215,23 +207,12 @@ async def scrape_google_maps(
     progress_callback=None,
 ) -> list[LeadResult]:
     """
-    Scrape Google Maps for businesses matching the search term and location.
-
-    Args:
-        search_term: What to search for (e.g., "liquor stores")
-        location: Full location string (e.g., "10001 New York NY USA")
-        zipcode: Zip code
-        city: City name
-        state: State name
-        country: Country name
-        max_results: Maximum number of results to scrape
-        progress_callback: Async callback for progress updates
-
-    Returns:
-        List of LeadResult objects
+    Scrape Google Maps for businesses.
+    Phase 1: Collect place links by scrolling the search results feed.
+    Phase 2: Visit each place URL directly and extract full details.
     """
     results = []
-    query = f"{search_term} in {location}"
+    query = f"{search_term} {location}".strip()
     encoded_query = quote_plus(query)
     search_url = f"https://www.google.com/maps/search/{encoded_query}"
 
@@ -241,6 +222,7 @@ async def scrape_google_maps(
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
                 "--disable-blink-features=AutomationControlled",
             ],
         )
@@ -249,50 +231,65 @@ async def scrape_google_maps(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+                "Chrome/128.0.0.0 Safari/537.36"
             ),
         )
         page = await context.new_page()
 
         try:
+            # Phase 1: Collect links
             logger.info(f"Searching: {query}")
-            await page.goto(search_url, wait_until="networkidle", timeout=30000)
-            await asyncio.sleep(2)
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(3)
 
             # Accept cookies if prompted
             try:
-                accept_btn = await page.query_selector(
-                    'button[aria-label*="Accept"]'
-                )
+                accept_btn = await page.query_selector('button[aria-label*="Accept"]')
                 if accept_btn:
                     await accept_btn.click()
                     await asyncio.sleep(1)
             except Exception:
                 pass
 
-            # Scroll to load all results
-            place_links = await _scroll_results(page)
-            place_links = place_links[:max_results]
-            total = len(place_links)
-            logger.info(f"Found {total} places for '{query}'")
+            # Wait for feed
+            feed_selector = '[role="feed"]'
+            try:
+                await page.wait_for_selector(feed_selector, timeout=10000)
+            except Exception:
+                feed_selector = 'div[role="main"]'
+                try:
+                    await page.wait_for_selector(feed_selector, timeout=5000)
+                except Exception:
+                    logger.error(f"No results feed found for '{query}'")
+                    await browser.close()
+                    return results
 
-            # Visit each place and extract data
+            place_links = await collect_links(page, feed_selector, max_results)
+            total = len(place_links)
+            logger.info(f"Collected {total} place links for '{query}'")
+
+            # Phase 2: Visit each place and extract details
+            scraped_names = set()
             for i, link in enumerate(place_links):
                 try:
-                    await page.goto(link, wait_until="networkidle", timeout=20000)
-                    await asyncio.sleep(1)
+                    await page.goto(link, wait_until="domcontentloaded", timeout=15000)
 
                     lead = await _extract_place_data(
                         page, search_term, zipcode, city, state, country
                     )
-                    results.append(lead)
+
+                    # Dedup by name
+                    if lead.name and lead.name not in scraped_names:
+                        scraped_names.add(lead.name)
+                        results.append(lead)
 
                     if progress_callback:
                         await progress_callback(i + 1, total)
 
                 except Exception as e:
-                    logger.error(f"Error scraping place {link}: {e}")
-                    continue
+                    logger.error(f"Error scraping place {i}: {e}")
+
+            logger.info(f"Scraped {len(results)} unique places for '{query}'")
 
         except Exception as e:
             logger.error(f"Error during Google Maps scraping: {e}")
