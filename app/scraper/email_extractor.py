@@ -148,10 +148,100 @@ def _find_contact_pages(html: str, base_url: str) -> list[str]:
     return list(set(pages))[:5]  # Max 5 contact pages
 
 
+async def _playwright_extract_emails(url: str) -> tuple[list[str], dict[str, str]]:
+    """
+    Fallback: use Playwright to extract emails from JS-rendered pages.
+    Handles Shopify, React, Angular, and other SPA sites.
+    """
+    emails = []
+    social_links = {"facebook": "", "instagram": "", "twitter": "", "linkedin": ""}
+
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = await browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+                )
+            )
+
+            # Visit homepage
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(2)
+
+            # Extract emails and social links via JavaScript
+            data = await page.evaluate("""() => {
+                const body = document.body.innerHTML;
+                const emailRegex = /[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}/g;
+                const emails = (body.match(emailRegex) || []);
+
+                // Also check mailto links
+                document.querySelectorAll('a[href*="mailto:"]').forEach(a => {
+                    const email = a.href.replace('mailto:', '').split('?')[0].trim();
+                    if (email && email.includes('@')) emails.push(email);
+                });
+
+                // Social links
+                const social = {facebook: '', instagram: '', twitter: '', linkedin: ''};
+                document.querySelectorAll('a[href]').forEach(a => {
+                    const h = a.href.toLowerCase();
+                    if (h.includes('facebook.com/') && !social.facebook) social.facebook = a.href;
+                    if (h.includes('instagram.com/') && !social.instagram) social.instagram = a.href;
+                    if ((h.includes('twitter.com/') || h.includes('x.com/')) && !social.twitter) social.twitter = a.href;
+                    if (h.includes('linkedin.com/') && !social.linkedin) social.linkedin = a.href;
+                });
+
+                // Find contact page URLs
+                const contactPages = [];
+                document.querySelectorAll('a[href]').forEach(a => {
+                    const h = a.href.toLowerCase();
+                    const t = a.textContent.toLowerCase();
+                    if (['contact', 'about'].some(kw => h.includes(kw) || t.includes(kw))) {
+                        if (a.href.startsWith(window.location.origin)) contactPages.push(a.href);
+                    }
+                });
+
+                return {emails: [...new Set(emails)], social, contactPages: [...new Set(contactPages)].slice(0, 3)};
+            }""")
+
+            emails = data.get("emails", [])
+            social_links = data.get("social", social_links)
+
+            # Visit contact pages for more emails
+            for contact_url in data.get("contactPages", []):
+                try:
+                    await page.goto(contact_url, wait_until="domcontentloaded", timeout=10000)
+                    await asyncio.sleep(1.5)
+                    page_emails = await page.evaluate("""() => {
+                        const body = document.body.innerHTML;
+                        const emailRegex = /[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}/g;
+                        const emails = (body.match(emailRegex) || []);
+                        document.querySelectorAll('a[href*="mailto:"]').forEach(a => {
+                            const email = a.href.replace('mailto:', '').split('?')[0].trim();
+                            if (email && email.includes('@')) emails.push(email);
+                        });
+                        return [...new Set(emails)];
+                    }""")
+                    emails.extend(page_emails)
+                except Exception:
+                    pass
+
+            await browser.close()
+    except Exception as e:
+        logger.debug(f"Playwright email extraction failed for {url}: {e}")
+
+    return _filter_emails(emails), social_links
+
+
 async def extract_website_emails(website_url: str) -> dict:
     """
     Deep email extraction from a business website.
-    Checks homepage + contact/about pages.
+    First tries fast aiohttp, then falls back to Playwright for JS-rendered sites.
 
     Returns dict with:
         - emails: list of all emails found
@@ -167,6 +257,7 @@ async def extract_website_emails(website_url: str) -> dict:
     all_emails = []
     social_links = {}
 
+    # Phase 1: Fast aiohttp extraction
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_REQUESTS, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
         # Fetch homepage
@@ -183,14 +274,24 @@ async def extract_website_emails(website_url: str) -> dict:
                 for page_html in pages:
                     if isinstance(page_html, str) and page_html:
                         all_emails.extend(_extract_emails_from_html(page_html))
-                        # Also check contact pages for social links
                         page_social = _extract_social_links(page_html, website_url)
                         for key, val in page_social.items():
                             if val and not social_links.get(key):
                                 social_links[key] = val
 
+    filtered = _filter_emails(all_emails)
+
+    # Phase 2: If no emails found, try Playwright for JS-rendered sites
+    if not filtered:
+        logger.info(f"No emails via aiohttp for {website_url}, trying Playwright...")
+        pw_emails, pw_social = await _playwright_extract_emails(website_url)
+        filtered.extend(pw_emails)
+        for key, val in pw_social.items():
+            if val and not social_links.get(key):
+                social_links[key] = val
+
     return {
-        "emails": _filter_emails(all_emails),
+        "emails": _filter_emails(filtered),
         "social_links": social_links,
     }
 
