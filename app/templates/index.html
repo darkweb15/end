@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Restaurant Leads Scraper</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div>
+            <h1>Restaurant Leads Scraper</h1>
+            <span class="subtitle">Google Maps Lead Generation &amp; POS Detection</span>
+        </div>
+    </header>
+
+    <!-- Main Content -->
+    <div class="main-container">
+        <!-- Left Panel - Input -->
+        <aside class="input-panel">
+            <h2>Scraping Configuration</h2>
+
+            <div class="form-group">
+                <label>
+                    Search Terms / Categories
+                    <span class="hint">(one per line)</span>
+                </label>
+                <textarea id="searchTerms" placeholder="liquor stores
+wine shops
+beer distributors
+alcohol stores
+bar supplies"></textarea>
+            </div>
+
+            <div class="form-group">
+                <label>
+                    Zip Codes
+                    <span class="hint">(format: zipcode city state country)</span>
+                </label>
+                <textarea id="zipCodes" placeholder="10001 New York NY USA
+90001 Los Angeles CA USA
+60601 Chicago IL USA
+77001 Houston TX USA"></textarea>
+            </div>
+
+            <div class="form-group">
+                <label>Max Results per Search</label>
+                <input type="number" id="maxResults" value="20" min="1" max="100">
+            </div>
+
+            <button id="startBtn" class="btn btn-primary">
+                Start Scraping
+            </button>
+        </aside>
+
+        <!-- Right Panel - Results -->
+        <main class="results-panel">
+            <!-- Stats Bar -->
+            <div class="stats-bar">
+                <div class="stat-card">
+                    <div class="stat-value" id="statTotal">0</div>
+                    <div class="stat-label">Total Leads</div>
+                </div>
+                <div class="stat-card emails">
+                    <div class="stat-value" id="statEmails">0</div>
+                    <div class="stat-label">With Emails</div>
+                </div>
+                <div class="stat-card pos">
+                    <div class="stat-value" id="statPos">0</div>
+                    <div class="stat-label">POS Detected</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-value" id="statRunning">Idle</div>
+                    <div class="stat-label">Status</div>
+                </div>
+            </div>
+
+            <!-- Progress Bar -->
+            <div class="progress-container" id="progressContainer">
+                <div class="progress-header">
+                    <span class="progress-text" id="progressText">Starting...</span>
+                    <span class="progress-text" id="progressPercent">0%</span>
+                </div>
+                <div class="progress-bar-outer">
+                    <div class="progress-bar-inner" id="progressBar"></div>
+                </div>
+            </div>
+
+            <!-- Actions Bar -->
+            <div class="actions-bar">
+                <input type="text" class="search-filter" id="filterInput" placeholder="Filter results by name, email, city...">
+                <button class="btn btn-success btn-sm" id="exportCsvBtn">Export CSV</button>
+                <button class="btn btn-outline btn-sm" id="exportJsonBtn">Export JSON</button>
+            </div>
+
+            <!-- Empty State -->
+            <div class="empty-state" id="emptyState">
+                <div class="icon">&#x1F50D;</div>
+                <h3>No Results Yet</h3>
+                <p>Enter your search terms and zip codes, then click "Start Scraping" to begin finding leads.</p>
+            </div>
+
+            <!-- Results Table -->
+            <div class="table-container" id="tableContainer" style="display: none;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>#</th>
+                            <th>Name</th>
+                            <th>Address</th>
+                            <th>Phone</th>
+                            <th>Email</th>
+                            <th>All Emails</th>
+                            <th>Source</th>
+                            <th>Website</th>
+                            <th>Facebook</th>
+                            <th>Rating</th>
+                            <th>Reviews</th>
+                            <th>POS?</th>
+                            <th>POS System</th>
+                            <th>Status</th>
+                            <th>Map</th>
+                        </tr>
+                    </thead>
+                    <tbody id="resultsBody">
+                    </tbody>
+                </table>
+            </div>
+        </main>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
