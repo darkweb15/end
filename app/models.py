@@ -59,6 +59,11 @@ class LeadResult(BaseModel):
     pos_system: str = ""
     pos_details: str = ""
 
+    # Delivery & Storefront
+    delivery_services: str = ""
+    website_type: str = ""
+    storefront: str = ""
+
 
 class ScrapeJob(BaseModel):
     """Represents a scraping job with progress tracking."""

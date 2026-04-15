@@ -10,10 +10,11 @@ from app.scraper.google_maps import scrape_google_maps
 from app.scraper.email_extractor import extract_all_emails
 from app.scraper.pos_detector import detect_pos_system
 from app.config import MAX_CONCURRENT_BROWSERS
+from app import database as db
 
 logger = logging.getLogger(__name__)
 
-# In-memory job storage
+# In-memory job storage (for real-time progress tracking)
 _jobs: dict[str, ScrapeJob] = {}
 
 
@@ -68,11 +69,14 @@ async def _enrich_lead(lead: LeadResult) -> LeadResult:
                     lead.final_email = fb_emails[0]
                     lead.email_source = "Facebook"
 
-        # Detect POS system
+        # Detect POS system, delivery services, website type, storefront
         pos_result = await detect_pos_system(lead.website)
         lead.has_pos = "Yes" if pos_result["has_pos"] else "No"
         lead.pos_system = pos_result["pos_system"]
         lead.pos_details = pos_result["pos_details"]
+        lead.delivery_services = pos_result.get("delivery_services", "")
+        lead.website_type = pos_result.get("website_type", "Unknown")
+        lead.storefront = pos_result.get("storefront", "No")
 
     except Exception as e:
         logger.error(f"Error enriching lead {lead.name}: {e}")
@@ -115,6 +119,16 @@ async def run_scrape_job(request: ScrapeRequest) -> str:
     )
     _jobs[job_id] = job
 
+    # Save task to Supabase
+    search_terms_str = ", ".join(request.search_terms)
+    zip_codes_str = ", ".join(request.zip_codes)
+    await db.create_task(
+        job_id=job_id,
+        search_term=search_terms_str,
+        zip_codes=zip_codes_str,
+        industry=request.search_terms[0] if request.search_terms else "",
+    )
+
     # Run the job in background
     asyncio.create_task(_execute_job(job, request))
     return job_id
@@ -143,16 +157,42 @@ async def _execute_job(job: ScrapeJob, request: ScrapeRequest):
                     progress_callback=progress_cb,
                 )
 
-                # Enrich each lead with emails and POS detection
+                # Check for duplicates against DB before enriching
+                new_leads = []
+                for lead in leads:
+                    if lead.name:
+                        is_dup = await db.is_duplicate(lead.name, lead.address)
+                        if is_dup:
+                            logger.info(f"  SKIP (duplicate): {lead.name}")
+                        else:
+                            new_leads.append(lead)
+
+                logger.info(
+                    f"New leads: {len(new_leads)} / {len(leads)} "
+                    f"(skipped {len(leads) - len(new_leads)} duplicates)"
+                )
+
+                # Enrich each NEW lead with emails and POS detection
                 enriched_leads = []
-                enrich_tasks = [_enrich_lead(lead) for lead in leads]
+                enrich_tasks = [_enrich_lead(lead) for lead in new_leads]
                 enriched = await asyncio.gather(*enrich_tasks, return_exceptions=True)
                 for result in enriched:
                     if isinstance(result, LeadResult):
                         enriched_leads.append(result)
 
+                # Save to Supabase
+                saved = await db.save_leads_batch(enriched_leads, job.job_id)
+                logger.info(f"Saved {saved} leads to database for job {job.job_id}")
+
                 job.results.extend(enriched_leads)
                 job.completed += 1
+
+                # Update task progress in DB
+                await db.update_task_status(
+                    job.job_id, "Running",
+                    scraped_count=len(job.results),
+                    total_results=len(job.results),
+                )
 
         # Create tasks for all combinations
         tasks = []
@@ -167,9 +207,15 @@ async def _execute_job(job: ScrapeJob, request: ScrapeRequest):
             await asyncio.gather(*tasks, return_exceptions=True)
 
         job.status = "completed"
+        await db.update_task_status(
+            job.job_id, "Completed",
+            scraped_count=len(job.results),
+            total_results=len(job.results),
+        )
         logger.info(f"Job {job.job_id} completed. Found {len(job.results)} leads.")
 
     except Exception as e:
         job.status = "failed"
         job.errors.append(str(e))
+        await db.update_task_status(job.job_id, "Failed")
         logger.error(f"Job {job.job_id} failed: {e}")
