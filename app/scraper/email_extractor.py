@@ -369,38 +369,176 @@ async def extract_website_emails(website_url: str) -> dict:
 
 
 async def extract_facebook_email(facebook_url: str) -> list[str]:
-    """Extract email from a Facebook business page."""
+    """
+    Extract email from a Facebook business page using Playwright.
+    Facebook blocks plain HTTP requests, so we need a real browser.
+    Strategy: Use desktop browser → close login popup → scrape page content.
+    Tries the main page first (has most data in HTML), then /about variants.
+    """
     if not facebook_url:
         return []
 
     emails = []
     base = facebook_url.rstrip("/")
-    fb_urls = [base + "/about", base + "/about_contact_and_basic_info", base]
 
-    connector = aiohttp.TCPConnector(limit=5, ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        for url in fb_urls:
-            html = await _fetch_page(session, url)
-            if html:
-                found = find_emails(html)
-                emails.extend(found)
-                if found:
-                    break
+    # Normalize URL to www.facebook.com (desktop version shows more data)
+    parsed_fb = urlparse(base)
+    if parsed_fb.netloc and "facebook.com" in parsed_fb.netloc:
+        desktop_base = parsed_fb._replace(netloc="www.facebook.com").geturl()
+    else:
+        desktop_base = base
+
+    # Main page first (contains email in page data), then /about variants
+    fb_urls = [
+        desktop_base,
+        desktop_base + "/about",
+        desktop_base + "/about_contact_and_basic_info",
+    ]
+
+    try:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/128.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+            )
+            page = await context.new_page()
+            page.set_default_timeout(12000)
+
+            for url in fb_urls:
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    await asyncio.sleep(3)
+
+                    # Close the login popup that Facebook shows to non-logged-in users
+                    try:
+                        close_btn = await page.query_selector('[aria-label="Close"]')
+                        if close_btn:
+                            await close_btn.click()
+                            await asyncio.sleep(1)
+                            logger.debug(f"Closed Facebook login popup on {url}")
+                    except Exception:
+                        pass
+
+                    # Scroll down to load more content
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 3)")
+                    await asyncio.sleep(1)
+
+                    # Extract emails from full rendered page via JS
+                    page_data = await page.evaluate("""() => {
+                        // Get the full page HTML (includes data in scripts, meta tags, etc.)
+                        const fullHtml = document.documentElement.innerHTML.toLowerCase()
+                            .replace(/\\[at\\]/g, '@').replace(/\\(at\\)/g, '@')
+                            .replace(/\\[dot\\]/g, '.').replace(/\\(dot\\)/g, '.');
+
+                        const emailRegex = /[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}/g;
+                        const emails = [...new Set(fullHtml.match(emailRegex) || [])];
+
+                        // Check mailto links
+                        document.querySelectorAll('a[href*="mailto:"]').forEach(a => {
+                            const email = a.href.replace('mailto:', '').split('?')[0].trim().toLowerCase();
+                            if (email && email.includes('@') && !emails.includes(email)) emails.push(email);
+                        });
+
+                        // Check text nodes for email patterns
+                        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                        while (walker.nextNode()) {
+                            const text = walker.currentNode.textContent.toLowerCase()
+                                .replace(/\\[at\\]/g, '@').replace(/\\(at\\)/g, '@')
+                                .replace(/\\[dot\\]/g, '.').replace(/\\(dot\\)/g, '.');
+                            const found = text.match(emailRegex);
+                            if (found) found.forEach(e => { if (!emails.includes(e)) emails.push(e); });
+                        }
+
+                        return emails;
+                    }""")
+
+                    if page_data:
+                        found = find_emails(" ".join(page_data))
+                        emails.extend(found)
+                        if found:
+                            logger.info(f"Found Facebook emails from {url}: {found}")
+                            break
+
+                except Exception as e:
+                    logger.debug(f"Facebook page fetch failed for {url}: {e}")
+                    continue
+
+            await browser.close()
+
+    except Exception as e:
+        logger.warning(f"Playwright Facebook extraction failed for {facebook_url}: {e}")
 
     return find_emails(" ".join(emails)) if emails else []
 
 
 async def extract_instagram_email(instagram_url: str) -> list[str]:
-    """Extract email from an Instagram profile bio."""
+    """
+    Extract email from an Instagram profile bio using Playwright.
+    Instagram also blocks plain HTTP requests, needs a real browser.
+    """
     if not instagram_url:
         return []
 
     emails = []
-    connector = aiohttp.TCPConnector(limit=5, ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        html = await _fetch_page(session, instagram_url)
-        if html:
-            emails = find_emails(html)
+
+    try:
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = await browser.new_page(
+                user_agent=(
+                    "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/128.0.0.0 Mobile Safari/537.36"
+                ),
+            )
+            page.set_default_timeout(12000)
+
+            await page.goto(instagram_url, wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(2)
+
+            # Extract emails from rendered page
+            page_emails = await page.evaluate("""() => {
+                const body = document.body.innerHTML.toLowerCase()
+                    .replace(/\\[at\\]/g, '@').replace(/\\(at\\)/g, '@')
+                    .replace(/\\[dot\\]/g, '.').replace(/\\(dot\\)/g, '.');
+                const emailRegex = /[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}/g;
+                const emails = [...new Set(body.match(emailRegex) || [])];
+                document.querySelectorAll('a[href*="mailto:"]').forEach(a => {
+                    const email = a.href.replace('mailto:', '').split('?')[0].trim().toLowerCase();
+                    if (email && email.includes('@') && !emails.includes(email)) emails.push(email);
+                });
+                return emails;
+            }""")
+
+            if page_emails:
+                emails = find_emails(" ".join(page_emails))
+
+            await browser.close()
+
+    except Exception as e:
+        logger.debug(f"Playwright Instagram extraction failed for {instagram_url}: {e}")
+        # Fallback to aiohttp
+        connector = aiohttp.TCPConnector(limit=5, ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            html = await _fetch_page(session, instagram_url)
+            if html:
+                emails = find_emails(html)
 
     return emails
 
