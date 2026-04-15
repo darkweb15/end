@@ -382,9 +382,11 @@ async def extract_facebook_email(facebook_url: str) -> list[str]:
     base = facebook_url.rstrip("/")
 
     # Normalize URL to www.facebook.com (desktop version shows more data)
-    desktop_base = base.replace("m.facebook.com", "www.facebook.com")
-    if "www." not in desktop_base and "facebook.com" in desktop_base:
-        desktop_base = desktop_base.replace("facebook.com", "www.facebook.com")
+    parsed_fb = urlparse(base)
+    if parsed_fb.netloc and "facebook.com" in parsed_fb.netloc:
+        desktop_base = parsed_fb._replace(netloc="www.facebook.com").geturl()
+    else:
+        desktop_base = base
 
     # Main page first (contains email in page data), then /about variants
     fb_urls = [
