@@ -1,0 +1,10 @@
+import { jsx as _jsx } from "react/jsx-runtime";
+import * as React from "react";
+import { cn } from "@/lib/utils";
+export const Table = React.forwardRef(({ className, ...props }, ref) => (_jsx("div", { className: "w-full overflow-auto rounded-xl border border-border/60", children: _jsx("table", { ref: ref, className: cn("w-full text-sm caption-bottom", className), ...props }) })));
+Table.displayName = "Table";
+export const THead = ({ className, ...props }) => (_jsx("thead", { className: cn("bg-surface-2/80 text-xs uppercase tracking-wider", className), ...props }));
+export const TBody = ({ className, ...props }) => (_jsx("tbody", { className: cn("divide-y divide-border/50", className), ...props }));
+export const TR = ({ className, ...props }) => (_jsx("tr", { className: cn("hover:bg-surface/60 transition-colors", className), ...props }));
+export const TH = ({ className, ...props }) => (_jsx("th", { className: cn("px-4 py-3 text-left font-semibold text-muted-foreground whitespace-nowrap", className), ...props }));
+export const TD = ({ className, ...props }) => (_jsx("td", { className: cn("px-4 py-3 text-foreground", className), ...props }));

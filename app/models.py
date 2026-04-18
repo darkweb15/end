@@ -74,3 +74,5 @@ class ScrapeJob(BaseModel):
     completed: int = 0
     results: list[LeadResult] = []
     errors: list[str] = []
+    discovered: int = 0  # total places discovered from Google Maps
+    skipped_duplicates: int = 0  # places skipped because place_id is already in DB

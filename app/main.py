@@ -1,15 +1,24 @@
 """FastAPI application for the Restaurant Leads Scraper."""
 
+import io
 import logging
+import os
+import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
-from app.models import ScrapeRequest
-from app.scraper.orchestrator import run_scrape_job, get_job, get_all_jobs
+from app.models import LeadResult, ScrapeRequest
+from app.scraper.orchestrator import get_all_jobs, get_job, run_scrape_job
 from app.exporter import export_to_csv, export_to_json
 from app import database as db
 
@@ -18,21 +27,37 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
-app = FastAPI(title="Restaurant Leads Scraper", version="2.0.0")
+app = FastAPI(title="LeadScraper Pro", version="3.0.0")
 
-# Static files and templates
 BASE_DIR = Path(__file__).resolve().parent
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+STATIC_DIR = BASE_DIR / "static"
+DIST_DIR = STATIC_DIR / "dist"
+
+# /static serves legacy assets (logos, etc.); the Vite build output lives at
+# /static/dist and is served by the /assets route plus the SPA catch-all below.
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# React build serves its hashed bundles from /assets; mount if build exists.
+if (DIST_DIR / "assets").exists():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(DIST_DIR / "assets")),
+        name="spa-assets",
+    )
+
+# Fallback Jinja templates (useful in dev if React build is missing).
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    """Render the main dashboard."""
-    return templates.TemplateResponse("index.html", {"request": request})
+# ─── Request models ─────────────────────────────────────────────────
+
+
+class BulkIds(BaseModel):
+    job_ids: list[str]
 
 
 # ─── Scraping Endpoints ─────────────────────────────────────────────
+
 
 @app.post("/api/scrape")
 async def start_scrape(request: ScrapeRequest):
@@ -63,6 +88,8 @@ async def get_job_status(job_id: str):
         "total": job.total,
         "completed": job.completed,
         "results_count": len(job.results),
+        "discovered": job.discovered,
+        "skipped_duplicates": job.skipped_duplicates,
         "errors": job.errors,
         "results": [r.model_dump() for r in job.results],
     }
@@ -79,12 +106,15 @@ async def list_jobs():
             "total": j.total,
             "completed": j.completed,
             "results_count": len(j.results),
+            "discovered": j.discovered,
+            "skipped_duplicates": j.skipped_duplicates,
         }
         for j in jobs
     ]
 
 
 # ─── Database Task History Endpoints ────────────────────────────────
+
 
 @app.get("/api/tasks")
 async def list_tasks():
@@ -95,11 +125,21 @@ async def list_tasks():
 
 @app.delete("/api/tasks/{job_id}")
 async def delete_task(job_id: str):
-    """Delete a task and all its associated data from database."""
+    """Delete a task and all its associated leads (CASCADE)."""
     ok = await db.delete_task(job_id)
     if ok:
         return {"message": f"Task {job_id} and all its data deleted."}
     return JSONResponse(status_code=500, content={"error": "Failed to delete task."})
+
+
+@app.post("/api/tasks/bulk-delete")
+async def bulk_delete_tasks(body: BulkIds):
+    """Delete many tasks at once (and their leads via CASCADE)."""
+    deleted = 0
+    for job_id in body.job_ids:
+        if await db.delete_task(job_id):
+            deleted += 1
+    return {"deleted": deleted, "requested": len(body.job_ids)}
 
 
 @app.get("/api/tasks/{job_id}/results")
@@ -109,7 +149,76 @@ async def get_task_results(job_id: str):
     return {"results": results, "count": len(results)}
 
 
+def _rows_to_leads(rows: list[dict]) -> list[LeadResult]:
+    out: list[LeadResult] = []
+    empty = LeadResult()
+    for row in rows:
+        lead = LeadResult()
+        for field in empty.model_fields:
+            if field in row and row[field] is not None:
+                setattr(lead, field, str(row[field]))
+        out.append(lead)
+    return out
+
+
+@app.get("/api/tasks/{job_id}/export/{fmt}")
+async def export_single_task(job_id: str, fmt: str):
+    """Download a single task's leads as CSV or JSON (from Supabase)."""
+    rows = await db.get_task_results(job_id)
+    if not rows:
+        return JSONResponse(status_code=404, content={"error": "No data for this task."})
+
+    leads = _rows_to_leads(rows)
+    if fmt == "csv":
+        content = export_to_csv(leads)
+        return StreamingResponse(
+            iter([content]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="task_{job_id}.csv"'},
+        )
+    if fmt == "json":
+        content = export_to_json(leads)
+        return StreamingResponse(
+            iter([content]),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="task_{job_id}.json"'},
+        )
+    return JSONResponse(status_code=400, content={"error": "Use 'csv' or 'json'."})
+
+
+@app.post("/api/tasks/bulk-export")
+async def bulk_export_tasks(body: BulkIds):
+    """Download many tasks as a single zip of CSV files."""
+    if not body.job_ids:
+        return JSONResponse(status_code=400, content={"error": "No job_ids provided."})
+
+    buf = io.BytesIO()
+    included = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for job_id in body.job_ids:
+            rows = await db.get_task_results(job_id)
+            if not rows:
+                continue
+            leads = _rows_to_leads(rows)
+            csv_bytes = export_to_csv(leads).encode("utf-8")
+            zf.writestr(f"task_{job_id}.csv", csv_bytes)
+            included += 1
+
+    if included == 0:
+        return JSONResponse(status_code=404, content={"error": "No data found for given tasks."})
+
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="tasks_bulk_{included}.zip"'
+        },
+    )
+
+
 # ─── Database Business Data Endpoints ───────────────────────────────
+
 
 @app.get("/api/data")
 async def get_business_data(industry: str = "", limit: int = 5000):
@@ -128,8 +237,27 @@ async def get_industries():
 @app.get("/api/stats")
 async def get_stats():
     """Get overall database statistics."""
-    stats = await db.get_stats()
-    return stats
+    return await db.get_stats()
+
+
+@app.get("/api/db-status")
+async def db_status():
+    """Return whether Supabase is configured + reachable."""
+    url = os.environ.get("SUPABASE_URL", "").strip()
+    key = os.environ.get("SUPABASE_KEY", "").strip()
+    if not url or not key:
+        return {
+            "connected": False,
+            "reason": "SUPABASE_URL or SUPABASE_KEY not configured on the server",
+        }
+    client = db.get_client()
+    if not client:
+        return {"connected": False, "reason": "Failed to create Supabase client"}
+    try:
+        client.table("scraping_tasks").select("id").limit(1).execute()
+        return {"connected": True}
+    except Exception as e:  # pragma: no cover
+        return {"connected": False, "reason": str(e)[:200]}
 
 
 @app.delete("/api/data")
@@ -142,6 +270,7 @@ async def delete_all_data():
 
 
 # ─── Export Endpoints ───────────────────────────────────────────────
+
 
 @app.get("/api/export/{job_id}/{fmt}")
 async def export_results(job_id: str, fmt: str):
@@ -160,15 +289,14 @@ async def export_results(job_id: str, fmt: str):
             media_type="text/csv",
             headers={"Content-Disposition": f"attachment; filename=leads_{job_id}.csv"},
         )
-    elif fmt == "json":
+    if fmt == "json":
         content = export_to_json(job.results)
         return StreamingResponse(
             iter([content]),
             media_type="application/json",
             headers={"Content-Disposition": f"attachment; filename=leads_{job_id}.json"},
         )
-    else:
-        return JSONResponse(status_code=400, content={"error": "Invalid format. Use 'csv' or 'json'."})
+    return JSONResponse(status_code=400, content={"error": "Invalid format. Use 'csv' or 'json'."})
 
 
 @app.get("/api/export-db/{fmt}")
@@ -178,16 +306,7 @@ async def export_db_data(fmt: str, industry: str = ""):
     if not data:
         return JSONResponse(status_code=400, content={"error": "No data to export"})
 
-    # Convert DB rows to LeadResult objects for the exporter
-    from app.models import LeadResult
-    leads = []
-    for row in data:
-        lead = LeadResult()
-        for field in lead.model_fields:
-            if field in row and row[field] is not None:
-                setattr(lead, field, str(row[field]))
-        leads.append(lead)
-
+    leads = _rows_to_leads(data)
     suffix = f"_{industry}" if industry else "_all"
 
     if fmt == "csv":
@@ -197,12 +316,35 @@ async def export_db_data(fmt: str, industry: str = ""):
             media_type="text/csv",
             headers={"Content-Disposition": f"attachment; filename=leads{suffix}.csv"},
         )
-    elif fmt == "json":
+    if fmt == "json":
         content = export_to_json(leads)
         return StreamingResponse(
             iter([content]),
             media_type="application/json",
             headers={"Content-Disposition": f"attachment; filename=leads{suffix}.json"},
         )
-    else:
-        return JSONResponse(status_code=400, content={"error": "Invalid format. Use 'csv' or 'json'."})
+    return JSONResponse(status_code=400, content={"error": "Invalid format. Use 'csv' or 'json'."})
+
+
+# ─── SPA Serving (React build) ──────────────────────────────────────
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    """Serve the React app if built; fall back to legacy Jinja UI otherwise."""
+    spa_index = DIST_DIR / "index.html"
+    if spa_index.exists():
+        return FileResponse(str(spa_index))
+    return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.get("/{full_path:path}", response_class=HTMLResponse)
+async def spa_catch_all(full_path: str, request: Request):
+    """Client-side routes (e.g. /scraper, /history) fall back to the SPA shell."""
+    # Don't swallow API requests accidentally
+    if full_path.startswith("api/"):
+        return JSONResponse(status_code=404, content={"error": "Not found"})
+    spa_index = DIST_DIR / "index.html"
+    if spa_index.exists():
+        return FileResponse(str(spa_index))
+    return templates.TemplateResponse("index.html", {"request": request})

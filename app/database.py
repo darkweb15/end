@@ -226,6 +226,53 @@ async def get_existing_businesses(names_addresses: list[tuple[str, str]]) -> set
     return existing
 
 
+async def get_existing_place_ids(place_ids: list[str] | None = None) -> set[str]:
+    """
+    Return the set of place_ids already known in business_data.
+    If `place_ids` is provided, only those are checked (batched).
+    If `place_ids` is None, all known non-empty place_ids are returned.
+    """
+    client = get_client()
+    if not client:
+        return set()
+
+    existing: set[str] = set()
+    try:
+        if place_ids is not None:
+            ids = [p for p in place_ids if p]
+            if not ids:
+                return existing
+            # Chunk to avoid URL limits on `in_` queries
+            chunk = 200
+            for i in range(0, len(ids), chunk):
+                res = (
+                    client.table("business_data")
+                    .select("place_id")
+                    .in_("place_id", ids[i : i + chunk])
+                    .execute()
+                )
+                for row in res.data or []:
+                    pid = row.get("place_id")
+                    if pid:
+                        existing.add(pid)
+        else:
+            res = (
+                client.table("business_data")
+                .select("place_id")
+                .neq("place_id", "")
+                .limit(50000)
+                .execute()
+            )
+            for row in res.data or []:
+                pid = row.get("place_id")
+                if pid:
+                    existing.add(pid)
+    except Exception as e:
+        logger.debug(f"place_id dedup check failed: {e}")
+
+    return existing
+
+
 # ─── Query & Filter ─────────────────────────────────────────────────
 
 async def get_task_results(job_id: str) -> list[dict]:
