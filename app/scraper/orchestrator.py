@@ -139,6 +139,17 @@ async def _execute_job(job: ScrapeJob, request: ScrapeRequest):
     try:
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_BROWSERS)
 
+        # Load all known place_ids once at job start, so we can dedup across
+        # the entire history (any zip code, any time) — cheap on the server
+        # side (single Supabase query) and saves enrichment time.
+        known_place_ids: set[str] = await db.get_existing_place_ids(None)
+        logger.info(
+            f"Job {job.job_id}: loaded {len(known_place_ids)} known place_ids for dedup"
+        )
+        # Local lock so concurrent combinations don't both "discover" the same
+        # brand-new place_id and enrich it twice within a single job run.
+        seen_lock = asyncio.Lock()
+
         async def _scrape_combination(search_term: str, zip_line: str):
             async with semaphore:
                 zip_data = _parse_zip_code(zip_line)
@@ -157,19 +168,43 @@ async def _execute_job(job: ScrapeJob, request: ScrapeRequest):
                     progress_callback=progress_cb,
                 )
 
-                # Check for duplicates against DB before enriching
+                async with seen_lock:
+                    job.discovered += len(leads)
+
+                # Dedup by place_id first (most reliable). Fall back to
+                # name+address for leads where Google didn't expose a place_id.
                 new_leads = []
+                skipped = 0
                 for lead in leads:
-                    if lead.name:
-                        is_dup = await db.is_duplicate(lead.name, lead.address)
-                        if is_dup:
-                            logger.info(f"  SKIP (duplicate): {lead.name}")
-                        else:
-                            new_leads.append(lead)
+                    if not lead.name:
+                        continue
+                    async with seen_lock:
+                        if lead.place_id and lead.place_id in known_place_ids:
+                            logger.info(
+                                f"  SKIP (place_id seen): {lead.name} [{lead.place_id}]"
+                            )
+                            skipped += 1
+                            continue
+                        # Reserve this place_id so sibling combinations don't
+                        # pick the same brand-new place concurrently.
+                        if lead.place_id:
+                            known_place_ids.add(lead.place_id)
+
+                    if not lead.place_id:
+                        # No place_id — fall back to legacy name+address check
+                        if await db.is_duplicate(lead.name, lead.address):
+                            logger.info(f"  SKIP (name+address dup): {lead.name}")
+                            skipped += 1
+                            continue
+
+                    new_leads.append(lead)
+
+                async with seen_lock:
+                    job.skipped_duplicates += skipped
 
                 logger.info(
                     f"New leads: {len(new_leads)} / {len(leads)} "
-                    f"(skipped {len(leads) - len(new_leads)} duplicates)"
+                    f"(skipped {skipped} duplicates)"
                 )
 
                 # Enrich each NEW lead with emails and POS detection

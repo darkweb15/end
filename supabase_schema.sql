@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS business_data (
 CREATE INDEX IF NOT EXISTS idx_business_task_id ON business_data(task_id);
 CREATE INDEX IF NOT EXISTS idx_business_name_address ON business_data(name, address);
 CREATE INDEX IF NOT EXISTS idx_business_industry ON business_data(search_query);
+CREATE INDEX IF NOT EXISTS idx_business_place_id ON business_data(place_id)
+    WHERE place_id IS NOT NULL AND place_id <> '';
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON scraping_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_created ON scraping_tasks(created_at DESC);
 
