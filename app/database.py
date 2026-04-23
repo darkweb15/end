@@ -348,6 +348,88 @@ async def get_stats() -> dict:
         return {"total_businesses": 0, "total_emails": 0, "total_tasks": 0}
 
 
+# ─── Email Re-enrichment Support ────────────────────────────────────
+
+async def count_leads_missing_emails() -> int:
+    """Count leads without a final_email but with a website to try."""
+    client = get_client()
+    if not client:
+        return 0
+    try:
+        res = (
+            client.table("business_data")
+            .select("id", count="exact")
+            .or_("final_email.is.null,final_email.eq.")
+            .neq("website", "")
+            .execute()
+        )
+        return res.count if res.count is not None else len(res.data or [])
+    except Exception as e:
+        logger.error(f"Failed to count missing-email leads: {e}")
+        return 0
+
+
+async def get_leads_missing_emails(start_index: int, end_index: int) -> list[dict]:
+    """
+    Return leads without final_email, ordered by id ASC, sliced to the 1-based
+    inclusive index range [start_index, end_index].
+    """
+    client = get_client()
+    if not client:
+        return []
+
+    if start_index < 1:
+        start_index = 1
+    if end_index < start_index:
+        return []
+
+    # Supabase `.range(a, b)` is 0-indexed inclusive on both ends, so convert.
+    a = start_index - 1
+    b = end_index - 1
+
+    try:
+        res = (
+            client.table("business_data")
+            .select("id,name,website,facebook_link,instagram_link,google_maps_email,final_email")
+            .or_("final_email.is.null,final_email.eq.")
+            .neq("website", "")
+            .order("id", desc=False)
+            .range(a, b)
+            .execute()
+        )
+        return res.data or []
+    except Exception as e:
+        logger.error(f"Failed to fetch missing-email leads [{start_index}..{end_index}]: {e}")
+        return []
+
+
+async def update_lead_emails(lead_id: int, email_fields: dict) -> bool:
+    """UPDATE email columns on a single business_data row by id."""
+    client = get_client()
+    if not client:
+        return False
+
+    allowed = {
+        "final_email",
+        "website_email",
+        "all_website_emails",
+        "facebook_email",
+        "instagram_email",
+        "comparing_emails",
+        "email_source",
+    }
+    payload = {k: v for k, v in email_fields.items() if k in allowed and v is not None}
+    if not payload:
+        return False
+
+    try:
+        client.table("business_data").update(payload).eq("id", lead_id).execute()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to update emails for lead {lead_id}: {e}")
+        return False
+
+
 async def delete_all_data() -> bool:
     """Delete ALL business data and tasks. Use with caution."""
     client = get_client()
