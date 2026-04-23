@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from app.models import LeadResult, ScrapeRequest
 from app.scraper.orchestrator import get_all_jobs, get_job, run_scrape_job
+from app.scraper.reenrich import get_reenrich_job, start_reenrich_job
 from app.exporter import export_to_csv, export_to_json
 from app import database as db
 
@@ -54,6 +55,11 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 class BulkIds(BaseModel):
     job_ids: list[str]
+
+
+class ReenrichRange(BaseModel):
+    start_index: int
+    end_index: int
 
 
 # ─── Scraping Endpoints ─────────────────────────────────────────────
@@ -324,6 +330,72 @@ async def export_db_data(fmt: str, industry: str = ""):
             headers={"Content-Disposition": f"attachment; filename=leads{suffix}.json"},
         )
     return JSONResponse(status_code=400, content={"error": "Invalid format. Use 'csv' or 'json'."})
+
+
+# ─── Email Re-enrichment Endpoints ──────────────────────────────────
+
+
+@app.get("/api/leads/missing-emails/count")
+async def missing_emails_count():
+    """How many leads (with a website) currently have no final_email."""
+    count = await db.count_leads_missing_emails()
+    return {"count": count}
+
+
+@app.get("/api/leads/missing-emails")
+async def missing_emails_preview(start: int = 1, end: int = 50):
+    """
+    Preview a slice of the missing-email leads, ordered by `id` ASC so the
+    1-based index shown in the UI matches what the re-enrich endpoint will
+    operate on.
+    """
+    if end < start:
+        return {"leads": [], "start": start, "end": end}
+    rows = await db.get_leads_missing_emails(start, end)
+    # Attach the 1-based index so the UI can render it without re-computing.
+    out = []
+    for i, row in enumerate(rows, start=start):
+        out.append(
+            {
+                "index": i,
+                "id": row.get("id"),
+                "name": row.get("name"),
+                "website": row.get("website"),
+            }
+        )
+    return {"leads": out, "start": start, "end": end}
+
+
+@app.post("/api/leads/re-enrich-emails")
+async def reenrich_emails(payload: ReenrichRange):
+    """Kick off a background email-only re-enrichment for the given range."""
+    if payload.start_index < 1 or payload.end_index < payload.start_index:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "start_index must be >= 1 and end_index must be >= start_index."
+            },
+        )
+    if payload.end_index - payload.start_index > 999:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Range too large. Max 1000 leads per run."},
+        )
+
+    job = await start_reenrich_job(payload.start_index, payload.end_index)
+    return {
+        "job_id": job.job_id,
+        "start_index": job.start_index,
+        "end_index": job.end_index,
+    }
+
+
+@app.get("/api/leads/re-enrich/{job_id}")
+async def reenrich_status(job_id: str):
+    job = get_reenrich_job(job_id)
+    if not job:
+        return JSONResponse(status_code=404, content={"error": "Job not found"})
+    return job.to_dict()
 
 
 # ─── SPA Serving (React build) ──────────────────────────────────────

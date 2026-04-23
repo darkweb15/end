@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Table, THead, TBody, TR, TH, TD } from "@/components/ui/table";
+import { ReenrichPanel } from "@/components/ReenrichPanel";
 import { api, type LeadResult } from "@/lib/api";
 import { downloadBlob } from "@/lib/utils";
 import { useToast } from "@/components/ui/toast";
@@ -68,6 +69,7 @@ export function Results() {
     <>
       <Header title="Results" subtitle="All business leads saved in Supabase" />
       <div className="p-6 space-y-4">
+        <ReenrichPanel onCompleted={() => load()} />
         <Card>
           <CardContent className="p-4 flex flex-wrap items-center gap-3">
             <div className="flex-1 min-w-[220px] relative">

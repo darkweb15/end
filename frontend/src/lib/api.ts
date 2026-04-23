@@ -136,4 +136,46 @@ export const api = {
     if (!res.ok) throw new Error(await res.text());
     return res.blob();
   },
+
+  /* email re-enrichment */
+  async getMissingEmailsCount(): Promise<{ count: number }> {
+    return req(`/api/leads/missing-emails/count`);
+  },
+  async previewMissingEmails(
+    start: number,
+    end: number
+  ): Promise<{
+    leads: { index: number; id: number; name: string; website: string }[];
+    start: number;
+    end: number;
+  }> {
+    return req(`/api/leads/missing-emails?start=${start}&end=${end}`);
+  },
+  async startReenrich(
+    start_index: number,
+    end_index: number
+  ): Promise<{ job_id: string; start_index: number; end_index: number }> {
+    return req(`/api/leads/re-enrich-emails`, {
+      method: "POST",
+      body: JSON.stringify({ start_index, end_index }),
+    });
+  },
+  async getReenrichJob(jobId: string): Promise<ReenrichStatus> {
+    return req(`/api/leads/re-enrich/${jobId}`);
+  },
+};
+
+export type ReenrichStatus = {
+  job_id: string;
+  start_index: number;
+  end_index: number;
+  status: "pending" | "running" | "completed" | "failed";
+  total: number;
+  processed: number;
+  updated: number;
+  no_email_found: number;
+  errors: string[];
+  started_at: string;
+  finished_at: string;
+  sample_updates: { id: number; name: string; email: string }[];
 };
